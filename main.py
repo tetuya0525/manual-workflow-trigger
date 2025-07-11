@@ -1,61 +1,100 @@
-# main.py
 # ==============================================================================
-# Memory Library - Manual Workflow Trigger
-# Role:         Triggers the main content processing workflow via a secure
-#               endpoint called by the API Gateway.
-# Version:      1.0 (Based on Architectural Charter v6.0)
+# Memory Library - Manual Workflow Trigger Service
+# Role:         Kicks off the article processing workflow.
+# Version:      1.0 (Flask Architecture)
 # Author:       心理 (Thinking Partner)
+# Last Updated: 2025-07-11
 # ==============================================================================
-import functions_framework
-from flask import request, jsonify
 import os
+from flask import Flask, request, jsonify
+import firebase_admin
+from firebase_admin import firestore
 from google.cloud import pubsub_v1
+import logging
 
-# --- 定数 (Constants) ---
-# 憲章2.6に基づき、設定は環境変数から取得します。
-PROJECT_ID = os.environ.get('GCP_PROJECT')
-TOPIC_ID = os.environ.get('PROCESS_BOOKS_TOPIC_ID') # 最初の処理(図書分類)を呼び出すトピック
-SERVICE_NAME = "manual-workflow-trigger"
+# Pythonの標準ロギングを設定
+logging.basicConfig(level=logging.INFO)
 
-# --- 初期化 (Initialization) ---
-publisher = None
-topic_path = None
+# Flaskアプリケーションを初期化
+app = Flask(__name__)
+
+# 環境変数から設定を読み込む
+PROJECT_ID = os.environ.get('GCP_PROJECT_ID') 
+# 次のステップで作成するPub/SubトピックのID
+ARTICLE_PROCESSING_TOPIC_ID = os.environ.get('ARTICLE_PROCESSING_TOPIC_ID') 
+
+# Firebaseの初期化
 try:
-    if PROJECT_ID and TOPIC_ID:
-        publisher = pubsub_v1.PublisherClient()
-        topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
-    else:
-        print(f"CRITICAL in {SERVICE_NAME}: GCP_PROJECT or PROCESS_BOOKS_TOPIC_ID environment variables are not set.")
+    firebase_admin.initialize_app()
+    db = firestore.client()
+    app.logger.info("Firebase app initialized successfully.")
 except Exception as e:
-    print(f"CRITICAL in {SERVICE_NAME}: Failed to initialize Pub/Sub client. Error: {e}")
+    app.logger.error(f"Error initializing Firebase app: {e}")
+    db = None
 
+# Pub/Subクライアントの初期化
+try:
+    publisher = pubsub_v1.PublisherClient()
+    topic_path = publisher.topic_path(PROJECT_ID, ARTICLE_PROCESSING_TOPIC_ID)
+    app.logger.info(f"Pub/Sub publisher initialized for topic: {topic_path}")
+except Exception as e:
+    app.logger.error(f"Error initializing Pub/Sub client: {e}")
+    publisher = None
+    topic_path = None
 
-@functions_framework.http
-def manual_workflow_trigger(request):
+@app.route('/', methods=['POST', 'OPTIONS'])
+def start_workflow():
     """
-    APIゲートウェイからの呼び出しを受け、Pub/Subにメッセージを発行して
-    内部ワークフローを開始させる。
+    ワークフローを開始するHTTPエンドポイント。
+    'received'ステータスの記事を検索し、処理のためにPub/Subメッセージを発行する。
     """
-    if not publisher or not topic_path:
-        return jsonify({"status": "error", "message": "サーバー設定エラー: Pub/Subクライアントが初期化されていません。"}), 503
+    # CORSプリフライトリクエストへの対応
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    headers = {'Access-Control-Allow-Origin': '*'}
 
-    if request.method != 'POST':
-        return jsonify({"status": "error", "message": "POSTメソッドを使用してください。"}), 405
+    # 依存関係のチェック
+    if not db or not publisher or not topic_path:
+        app.logger.error("A critical component (Firestore or Pub/Sub) is not initialized.")
+        return jsonify({"status": "error", "message": "Server configuration error."}), 500, headers
 
+    app.logger.info("Workflow trigger received. Searching for 'received' status articles.")
+    
+    processed_count = 0
+    error_count = 0
+    
     try:
-        message_data = b'{"message": "Manual workflow triggered."}'
-        future = publisher.publish(topic_path, message_data)
-        message_id = future.result()
+        # ステータスが 'received' の記事を検索
+        docs = db.collection('staging_articles').where('status', '==', 'received').stream()
 
-        print(f"SUCCESS: Workflow triggered. Message ID: {message_id} published to {topic_path}.")
+        for doc in docs:
+            doc_id = doc.id
+            try:
+                # Pub/SubにドキュメントIDをメッセージとして発行
+                future = publisher.publish(topic_path, doc_id.encode('utf-8'))
+                future.result()  # 発行が完了するまで待機
 
-        return jsonify({
-            "status": "success",
-            "message": "開館準備を開始するよう、全ての司書に通達しました。",
-            "messageId": message_id
-        }), 200
+                # Firestoreのドキュメントのステータスを 'queued' に更新
+                doc.reference.update({'status': 'queued'})
+                
+                app.logger.info(f"Queued document {doc_id} for processing.")
+                processed_count += 1
+            except Exception as e:
+                app.logger.error(f"Failed to queue document {doc_id}: {e}")
+                error_count += 1
+
+        message = f"Workflow started. Queued {processed_count} articles for processing."
+        if error_count > 0:
+            message += f" Failed to queue {error_count} articles."
+        
+        app.logger.info(message)
+        return jsonify({"status": "success", "message": message, "processed": processed_count, "errors": error_count}), 200, headers
 
     except Exception as e:
-        print(f"ERROR in {SERVICE_NAME}: Failed to publish message. Error: {e}")
-        # ここではエラー報告サービスは呼び出さず、ログ出力のみとします。
-        return jsonify({"status": "error", "message": "号令の発信中にサーバー内部でエラーが発生しました。"}), 500
+        app.logger.error(f"An error occurred during workflow execution: {e}")
+        return jsonify({"status": "error", "message": "An internal error occurred."}), 500, headers
