@@ -1,7 +1,7 @@
 # ==============================================================================
 # Memory Library - Manual Workflow Trigger Service
 # Role:         Kicks off the article processing workflow.
-# Version:      1.0 (Flask Architecture)
+# Version:      1.1 (Lazy Initialization / Stable)
 # Author:       心理 (Thinking Partner)
 # Last Updated: 2025-07-11
 # ==============================================================================
@@ -18,29 +18,35 @@ logging.basicConfig(level=logging.INFO)
 # Flaskアプリケーションを初期化
 app = Flask(__name__)
 
-# 環境変数から設定を読み込む
-PROJECT_ID = os.environ.get('GCP_PROJECT_ID') 
-# 次のステップで作成するPub/SubトピックのID
-ARTICLE_PROCESSING_TOPIC_ID = os.environ.get('ARTICLE_PROCESSING_TOPIC_ID') 
+# グローバル変数としてクライアントを保持 (遅延初期化のためNoneで開始)
+db = None
+publisher = None
 
-# Firebaseの初期化
-try:
-    firebase_admin.initialize_app()
-    db = firestore.client()
-    app.logger.info("Firebase app initialized successfully.")
-except Exception as e:
-    app.logger.error(f"Error initializing Firebase app: {e}")
-    db = None
+def get_firestore_client():
+    """Firestoreクライアントをシングルトンとして取得・初期化する"""
+    global db
+    if db is None:
+        try:
+            # Cloud Run環境では引数なしで自動的に初期化される
+            firebase_admin.initialize_app()
+            db = firestore.client()
+            app.logger.info("Firebase app initialized successfully.")
+        except Exception as e:
+            app.logger.error(f"Error initializing Firebase app: {e}")
+            # 初期化に失敗した場合、dbはNoneのまま
+    return db
 
-# Pub/Subクライアントの初期化
-try:
-    publisher = pubsub_v1.PublisherClient()
-    topic_path = publisher.topic_path(PROJECT_ID, ARTICLE_PROCESSING_TOPIC_ID)
-    app.logger.info(f"Pub/Sub publisher initialized for topic: {topic_path}")
-except Exception as e:
-    app.logger.error(f"Error initializing Pub/Sub client: {e}")
-    publisher = None
-    topic_path = None
+def get_pubsub_publisher():
+    """Pub/Sub Publisherクライアントをシングルトンとして取得・初期化する"""
+    global publisher
+    if publisher is None:
+        try:
+            publisher = pubsub_v1.PublisherClient()
+            app.logger.info("Pub/Sub publisher initialized successfully.")
+        except Exception as e:
+            app.logger.error(f"Error initializing Pub/Sub client: {e}")
+            # 初期化に失敗した場合、publisherはNoneのまま
+    return publisher
 
 @app.route('/', methods=['POST', 'OPTIONS'])
 def start_workflow():
@@ -58,25 +64,34 @@ def start_workflow():
     
     headers = {'Access-Control-Allow-Origin': '*'}
 
+    # 必要なクライアントを取得 (ここで初めて初期化が試みられる)
+    db_client = get_firestore_client()
+    pubsub_publisher = get_pubsub_publisher()
+
+    # 環境変数を取得
+    PROJECT_ID = os.environ.get('GCP_PROJECT_ID') 
+    ARTICLE_PROCESSING_TOPIC_ID = os.environ.get('ARTICLE_PROCESSING_TOPIC_ID')
+
     # 依存関係のチェック
-    if not db or not publisher or not topic_path:
-        app.logger.error("A critical component (Firestore or Pub/Sub) is not initialized.")
+    if not all([db_client, pubsub_publisher, PROJECT_ID, ARTICLE_PROCESSING_TOPIC_ID]):
+        app.logger.error("A critical component or environment variable is missing.")
         return jsonify({"status": "error", "message": "Server configuration error."}), 500, headers
 
-    app.logger.info("Workflow trigger received. Searching for 'received' status articles.")
+    topic_path = pubsub_publisher.topic_path(PROJECT_ID, ARTICLE_PROCESSING_TOPIC_ID)
+    app.logger.info(f"Workflow trigger received. Searching for 'received' status articles in topic: {topic_path}")
     
     processed_count = 0
     error_count = 0
     
     try:
         # ステータスが 'received' の記事を検索
-        docs = db.collection('staging_articles').where('status', '==', 'received').stream()
+        docs = db_client.collection('staging_articles').where('status', '==', 'received').stream()
 
         for doc in docs:
             doc_id = doc.id
             try:
                 # Pub/SubにドキュメントIDをメッセージとして発行
-                future = publisher.publish(topic_path, doc_id.encode('utf-8'))
+                future = pubsub_publisher.publish(topic_path, doc_id.encode('utf-8'))
                 future.result()  # 発行が完了するまで待機
 
                 # Firestoreのドキュメントのステータスを 'queued' に更新
@@ -98,3 +113,4 @@ def start_workflow():
     except Exception as e:
         app.logger.error(f"An error occurred during workflow execution: {e}")
         return jsonify({"status": "error", "message": "An internal error occurred."}), 500, headers
+
