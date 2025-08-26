@@ -1,5 +1,5 @@
 # ==============================================================================
-# Dockerfile for Manual Workflow Trigger Service
+# Dockerfile for Manual Workflow Trigger Service (Corrected)
 # ==============================================================================
 FROM python:3.12-slim
 
@@ -7,19 +7,21 @@ ENV PYTHONUNBUFFERED True
 ENV APP_HOME /app
 WORKDIR $APP_HOME
 
-# セキュリティ強化のため非rootユーザーを作成・使用
-RUN adduser --system --group appuser
-USER appuser
-
-# 依存関係をインストール
-COPY --chown=appuser:appuser requirements.txt .
+# 1. Install dependencies as the root user first
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ソースコードをコピー
+# 2. Create the non-root user for the application
+RUN adduser --system --group appuser
+
+# 3. Copy application code and set ownership
 COPY --chown=appuser:appuser . .
 
-# Cloud RunのPORT環境変数を設定
+# 4. Switch to the non-root user
+USER appuser
+
+# Cloud Run PORT environment variable
 ENV PORT 8080
 
-# エントリーポイント
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "main:app"]
+# 5. Run the application as the non-root user
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "main:create_app()"]
